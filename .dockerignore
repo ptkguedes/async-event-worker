@@ -1,0 +1,26 @@
+# Controle de versao e artefatos de planejamento
+.git
+.gitignore
+.agents
+
+# Ambientes virtuais e caches
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+coverage.xml
+
+# Configuracao local
+.env
+
+# Documentacao: ignora todo *.md, menos o README (o pyproject precisa dele)
+*.md
+!README.md
+
+# Nota: tests/ NAO e ignorado de proposito -- a suite de integracao
+# tambem roda dentro do container (docker compose run --rm api pytest).

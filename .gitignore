@@ -1,0 +1,36 @@
+# Artefatos de planejamento do agente -- nunca comitar
+.agents/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Configuracao local (os defaults ficam em .env.example)
+.env
+
+# Caches de ferramentas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
