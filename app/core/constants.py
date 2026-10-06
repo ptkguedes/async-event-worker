@@ -3,6 +3,14 @@
 # Header nativo que o RabbitMQ grava quando uma mensagem e dead-lettered.
 X_DEATH_HEADER = "x-death"
 
+# Argumentos de declaracao de fila (AMQP e extensoes do RabbitMQ).
+# Sao nomes do protocolo, nao configuracao: os VALORES vem sempre de Settings.
+X_QUEUE_TYPE_ARG = "x-queue-type"
+X_DEAD_LETTER_EXCHANGE_ARG = "x-dead-letter-exchange"
+X_DEAD_LETTER_ROUTING_KEY_ARG = "x-dead-letter-routing-key"
+X_MESSAGE_TTL_ARG = "x-message-ttl"
+QUEUE_TYPE_CLASSIC = "classic"
+
 # Headers que o worker acrescenta ao publicar na dead letter queue.
 X_RETRY_COUNT_HEADER = "x-retry-count"
 X_ATTEMPTS_HEADER = "x-attempts"
