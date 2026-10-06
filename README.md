@@ -320,6 +320,10 @@ Detalhes importantes:
 
 - Os testes **pulam com mensagem explicativa** (nao falham) se o Postgres ou o RabbitMQ nao
   responderem em 5s.
+- **Atencao:** o isolamento por `topology_prefix` vale para as filas, nao para o banco. A suite
+  roda `TRUNCATE TABLE tasks` antes de cada teste no banco apontado por `TEST_DATABASE_URL` --
+  que por default e o mesmo `async_event_worker` do Compose. Se quiser preservar os dados de
+  dev, aponte `TEST_DATABASE_URL` para outro banco antes de rodar a integracao.
 - O schema e aplicado pelo proprio `conftest.py` com `alembic upgrade head` -- isso valida a
   migration de verdade.
 - A topologia de teste usa `topology_prefix="test_"` (`test_tasks`, `test_tasks.retry`,

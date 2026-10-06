@@ -19,6 +19,9 @@ COPY pyproject.toml README.md ./
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
+# tests/ tambem vai para a imagem: permite rodar as suites dentro do container
+# (docker compose run --rm api python -m pytest -q) sem depender do bind mount.
+COPY tests ./tests
 
 RUN if [ "$INSTALL_DEV" = "true" ]; then \
         pip install --no-cache-dir -e ".[dev]"; \
