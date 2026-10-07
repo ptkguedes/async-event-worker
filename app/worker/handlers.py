@@ -21,7 +21,12 @@ from app.db.repository import TaskRepositoryProtocol
 
 logger = logging.getLogger(__name__)
 
-HandleOutcome = Literal["PROCESSED", "SKIPPED_DUPLICATE", "SKIPPED_CONCURRENT"]
+HandleOutcome = Literal[
+    "PROCESSED",
+    "SKIPPED_DUPLICATE",
+    "SKIPPED_CONCURRENT",
+    "SKIPPED_CLAIM_LOST",
+]
 
 # Assinatura do callable injetavel (os testes passam um spy contador).
 Processor = Callable[[uuid.UUID, str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -99,6 +104,8 @@ async def handle_task(
     repo: TaskRepositoryProtocol,
     attempts: int,
     processor: Processor = simulate_processing,
+    *,
+    claim_id: uuid.UUID,
 ) -> HandleOutcome:
     """Processa a task uma unica vez, mesmo com entregas duplicadas.
 
@@ -111,6 +118,12 @@ async def handle_task(
       duas entregas na mesma janela de prefetch) -- o chamador devolve a
       mensagem para o hop de retry.
 
+    `claim_id` e o token desta entrega: vai no claim e e exigido pelo
+    `mark_completed`. Se a escrita nao casar, esta entrega perdeu a linha para
+    outro consumidor ("SKIPPED_CLAIM_LOST") e nao tem mais nada a fazer -- o
+    efeito colateral dela ja rodou, o fencing protege a LINHA, nao desfaz o
+    efeito.
+
     `TaskProcessingError` levantada pelo processor sobe para o chamador (o callback
     AMQP), que decide entre retentar e mandar para a dead letter queue.
     """
@@ -119,6 +132,7 @@ async def handle_task(
         message_data.event_type,
         message_data.payload,
         attempts,
+        claim_id=claim_id,
     )
     log_context = {
         "task_id": str(message_data.task_id),
@@ -139,6 +153,13 @@ async def handle_task(
         message_data.event_type,
         message_data.payload,
     )
-    await repo.mark_completed(message_data.task_id, result)
+    written = await repo.mark_completed(message_data.task_id, result, claim_id=claim_id)
+    if written != "WRITTEN":
+        logger.warning(
+            "task claim lost before completion",
+            extra={**log_context, "write_result": written},
+        )
+        return "SKIPPED_CLAIM_LOST"
+
     logger.info("task processed", extra=log_context)
     return "PROCESSED"

@@ -32,6 +32,11 @@ class Task(Base):
     `claimed_at` e o LEASE desse claim: enquanto estiver fresca a linha
     PROCESSING pertence a um consumidor; expirado o lease, a linha volta a ser
     reclamavel (worker morto ou tentativa que nunca reportou).
+
+    `claim_id` e o TOKEN de fencing desse claim: a identidade da reserva que o
+    escritor observou. As escritas de report-back casam por ele, nao so por
+    `task_id`, para que um worker zumbi (lease vencido, linha ja reclamada por
+    outro consumidor) nao sobrescreva a linha do consumidor vivo.
     """
 
     __tablename__ = "tasks"
@@ -51,6 +56,12 @@ class Task(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # NULL = nenhum claim pendente (linha nova, COMPLETED ou FAILED).
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Token do claim; NULL pelo mesmo motivo de `claimed_at`. Trocado a cada
+    # claim, e o que torna uma report-back atrasada incapaz de casar a linha.
+    claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        postgresql.UUID(as_uuid=True),
+        nullable=True,
+    )
     result: Mapped[dict[str, Any] | None] = mapped_column(postgresql.JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

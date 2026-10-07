@@ -23,8 +23,12 @@ async def test_duplicate_delivery_runs_the_side_effect_once(
     message = _message(task_id)
     processor = CountingProcessor(result={"ok": True})
 
-    first = await handle_task(message, fake_repository, attempts=1, processor=processor)
-    second = await handle_task(message, fake_repository, attempts=2, processor=processor)
+    first = await handle_task(
+        message, fake_repository, attempts=1, processor=processor, claim_id=uuid.uuid4()
+    )
+    second = await handle_task(
+        message, fake_repository, attempts=2, processor=processor, claim_id=uuid.uuid4()
+    )
 
     assert first == "PROCESSED"
     assert second == "SKIPPED_DUPLICATE"
@@ -42,8 +46,12 @@ async def test_duplicate_delivery_keeps_the_first_attempts_value(
     message = _message(task_id)
     processor = CountingProcessor()
 
-    await handle_task(message, fake_repository, attempts=1, processor=processor)
-    await handle_task(message, fake_repository, attempts=4, processor=processor)
+    await handle_task(
+        message, fake_repository, attempts=1, processor=processor, claim_id=uuid.uuid4()
+    )
+    await handle_task(
+        message, fake_repository, attempts=4, processor=processor, claim_id=uuid.uuid4()
+    )
 
     # O short-circuit acontece antes de qualquer escrita: a linha nao e tocada.
     assert fake_repository.rows[task_id].attempts == 1
@@ -56,7 +64,13 @@ async def test_processing_failure_propagates_and_does_not_complete(
     processor = CountingProcessor(always_fail=True)
 
     with pytest.raises(TaskProcessingError):
-        await handle_task(_message(task_id), fake_repository, attempts=1, processor=processor)
+        await handle_task(
+            _message(task_id),
+            fake_repository,
+            attempts=1,
+            processor=processor,
+            claim_id=uuid.uuid4(),
+        )
 
     assert processor.count == 1
     assert fake_repository.rows[task_id].status == TaskStatus.PROCESSING
@@ -69,13 +83,32 @@ async def test_failed_task_is_processed_on_the_next_delivery(
     """Linha nao-COMPLETED pode ser reclamada: e assim que a retentativa funciona."""
     task_id = uuid.uuid4()
     processor = CountingProcessor(fail_times=1)
+    claim_id = uuid.uuid4()
 
     with pytest.raises(TaskProcessingError):
-        await handle_task(_message(task_id), fake_repository, attempts=1, processor=processor)
-    # O que `_route_failure` faz no fluxo real: grava FAILED e libera o claim.
-    await fake_repository.mark_failed(task_id, "forced failure on attempt 1", attempts=1)
+        await handle_task(
+            _message(task_id),
+            fake_repository,
+            attempts=1,
+            processor=processor,
+            claim_id=claim_id,
+        )
+    # O que `_route_failure` faz no fluxo real: grava FAILED (com o MESMO
+    # token do claim desta entrega) e libera o claim.
+    assert (
+        await fake_repository.mark_failed(
+            task_id, "forced failure on attempt 1", attempts=1, claim_id=claim_id
+        )
+        == "WRITTEN"
+    )
 
-    outcome = await handle_task(_message(task_id), fake_repository, attempts=2, processor=processor)
+    outcome = await handle_task(
+        _message(task_id),
+        fake_repository,
+        attempts=2,
+        processor=processor,
+        claim_id=uuid.uuid4(),
+    )
 
     assert outcome == "PROCESSED"
     assert processor.count == 2
@@ -91,9 +124,18 @@ async def test_concurrent_delivery_is_skipped_while_the_claim_lease_is_alive(
     processor = CountingProcessor()
 
     # Claim do "outro consumidor": a linha fica PROCESSING com lease fresco.
-    assert await fake_repository.claim_for_processing(task_id, "demo", {}, 1) == "CLAIMED"
+    assert (
+        await fake_repository.claim_for_processing(task_id, "demo", {}, 1, claim_id=uuid.uuid4())
+        == "CLAIMED"
+    )
 
-    outcome = await handle_task(_message(task_id), fake_repository, attempts=1, processor=processor)
+    outcome = await handle_task(
+        _message(task_id),
+        fake_repository,
+        attempts=1,
+        processor=processor,
+        claim_id=uuid.uuid4(),
+    )
 
     assert outcome == "SKIPPED_CONCURRENT"
     assert processor.count == 0
@@ -107,10 +149,16 @@ async def test_stale_claim_is_reclaimed_after_the_lease_expires(
     """Claim obsoleto (worker morto) nao bloqueia a task para sempre."""
     task_id = uuid.uuid4()
     processor = CountingProcessor()
-    await fake_repository.claim_for_processing(task_id, "demo", {}, 1)
+    await fake_repository.claim_for_processing(task_id, "demo", {}, 1, claim_id=uuid.uuid4())
 
     fake_repository.expire_claim(task_id)
-    outcome = await handle_task(_message(task_id), fake_repository, attempts=2, processor=processor)
+    outcome = await handle_task(
+        _message(task_id),
+        fake_repository,
+        attempts=2,
+        processor=processor,
+        claim_id=uuid.uuid4(),
+    )
 
     assert outcome == "PROCESSED"
     assert processor.count == 1

@@ -17,7 +17,7 @@ from app.core.constants import (
 )
 from app.core.exceptions import TaskProcessingError
 from app.db.models import Task, TaskStatus
-from app.db.repository import ClaimResult
+from app.db.repository import ClaimResult, FencedWriteResult
 
 
 def _now() -> datetime:
@@ -33,6 +33,7 @@ def make_task(
     result: dict[str, Any] | None = None,
     error: str | None = None,
     claimed_at: datetime | None = None,
+    claim_id: uuid.UUID | None = None,
 ) -> Task:
     """Instancia de Task completa (com timestamps) para uso fora do banco."""
     now = _now()
@@ -45,6 +46,7 @@ def make_task(
         result=result,
         error=error,
         claimed_at=claimed_at,
+        claim_id=claim_id,
         created_at=now,
         updated_at=now,
     )
@@ -54,7 +56,8 @@ class FakeTaskRepository:
     """TaskRepositoryProtocol em memoria com a mesma semantica de claim.
 
     Espelha a tabela de verdade de `app/db/repository.py`, lease incluido: um
-    claim PROCESSING ainda dentro de `claim_lease_seconds` devolve "LOCKED".
+    claim PROCESSING ainda dentro de `claim_lease_seconds` devolve "LOCKED", e
+    as report-backs sao fenced pelo `claim_id` do claim observado.
     """
 
     def __init__(self, claim_lease_seconds: float = 5.0) -> None:
@@ -79,6 +82,8 @@ class FakeTaskRepository:
         event_type: str,
         payload: dict[str, Any],
         attempts: int,
+        *,
+        claim_id: uuid.UUID,
     ) -> ClaimResult:
         """Mesma regra do repositorio real (COMPLETED e lease vivo nao sao reclamados)."""
         existing = self.rows.get(task_id)
@@ -96,11 +101,13 @@ class FakeTaskRepository:
                 status=TaskStatus.PROCESSING,
                 attempts=attempts,
                 claimed_at=_now(),
+                claim_id=claim_id,
             )
         else:
             existing.status = TaskStatus.PROCESSING
             existing.attempts = attempts
             existing.claimed_at = _now()
+            existing.claim_id = claim_id
             existing.updated_at = _now()
         return "CLAIMED"
 
@@ -109,21 +116,55 @@ class FakeTaskRepository:
             return False
         return _now() - task.claimed_at < timedelta(seconds=self.claim_lease_seconds)
 
-    async def mark_completed(self, task_id: uuid.UUID, result: dict[str, Any]) -> None:
+    def _fence(self, task_id: uuid.UUID, claim_id: uuid.UUID) -> FencedWriteResult:
+        """Mesmo rotulo do repositorio real para uma escrita que nao casa."""
+        task = self.rows.get(task_id)
+        if task is None:
+            return "MISSING"
+        if task.claim_id == claim_id and task.status == TaskStatus.PROCESSING:
+            return "WRITTEN"
+        return "CLAIM_LOST"
+
+    async def mark_completed(
+        self,
+        task_id: uuid.UUID,
+        result: dict[str, Any],
+        *,
+        claim_id: uuid.UUID,
+    ) -> FencedWriteResult:
+        written = self._fence(task_id, claim_id)
+        if written != "WRITTEN":
+            return written
+
         task = self.rows[task_id]
         task.status = TaskStatus.COMPLETED
         task.result = result
         task.error = None
         task.claimed_at = None
+        task.claim_id = None
         task.updated_at = _now()
+        return written
 
-    async def mark_failed(self, task_id: uuid.UUID, error: str, attempts: int) -> None:
+    async def mark_failed(
+        self,
+        task_id: uuid.UUID,
+        error: str,
+        attempts: int,
+        *,
+        claim_id: uuid.UUID,
+    ) -> FencedWriteResult:
+        written = self._fence(task_id, claim_id)
+        if written != "WRITTEN":
+            return written
+
         task = self.rows[task_id]
         task.status = TaskStatus.FAILED
         task.error = error
         task.attempts = attempts
         task.claimed_at = None
+        task.claim_id = None
         task.updated_at = _now()
+        return written
 
     async def get(self, task_id: uuid.UUID) -> Task | None:
         return self.rows.get(task_id)

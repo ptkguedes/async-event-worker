@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import signal
+import uuid
 from functools import partial
 
 from aio_pika.abc import AbstractIncomingMessage
@@ -29,7 +30,7 @@ from app.core.constants import (
 )
 from app.core.exceptions import TaskProcessingError
 from app.core.logging import configure_logging
-from app.db.repository import TaskRepository
+from app.db.repository import FencedWriteResult, TaskRepository
 from app.db.session import dispose_engine, get_engine, session_scope
 from app.worker.handlers import (
     Processor,
@@ -63,18 +64,22 @@ async def _persist_failure(
     error: str,
     attempts: int,
     settings: Settings,
-) -> None:
+    claim_id: uuid.UUID,
+) -> FencedWriteResult | None:
     """Grava a falha no banco SEM deixar o erro de persistencia escapar.
 
     CONTENCAO DELIBERADA: se o Postgres estiver fora, a excecao desta escrita
     nao pode impedir o `nack` (retry) nem o `publish` na DLX. Sem ack e sem
     nack a mensagem ficaria segurando um slot de prefetch para sempre, e o
     consumidor degradaria ate parar.
+
+    Devolve o resultado da escrita fenced, ou `None` quando a escrita levantou
+    e foi contida -- o chamador usa isso para decidir no broker.
     """
     try:
         async with session_scope(settings) as session:
-            await TaskRepository(session, settings).mark_failed(
-                task_message.task_id, error, attempts
+            return await TaskRepository(session, settings).mark_failed(
+                task_message.task_id, error, attempts, claim_id=claim_id
             )
     except Exception as exc:
         logger.error(
@@ -85,6 +90,7 @@ async def _persist_failure(
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )
+        return None
 
 
 async def _route_failure(
@@ -94,6 +100,7 @@ async def _route_failure(
     error: str,
     settings: Settings,
     publisher: TaskPublisher,
+    claim_id: uuid.UUID,
 ) -> None:
     """Decide entre retentar pela topologia nativa ou mandar para a DLX."""
     attempts = retry_count + 1
@@ -105,7 +112,15 @@ async def _route_failure(
         "error": error,
     }
 
-    await _persist_failure(task_message, error, attempts, settings)
+    write_result = await _persist_failure(task_message, error, attempts, settings, claim_id)
+
+    if write_result == "CLAIM_LOST":
+        # Outro consumidor detem a linha AGORA e tem a propria entrega para
+        # resolver a task: nackear seria uma retentativa duplicada e publicar
+        # na DLX seria um dead letter espurio. Esta entrega so sai de cena.
+        await message.ack()
+        logger.warning("task claim lost before the failure report", extra=log_context)
+        return
 
     if decide(retry_count, settings.task_max_retries) == "RETRY":
         # nack sem requeue: a DLX nativa encaminha para a fila de retry, que
@@ -192,6 +207,10 @@ async def on_message(
         settings.tasks_queue_name,
     )
     attempts = retry_count + 1
+    # Token de fencing desta entrega: o mesmo vale para o claim e para as duas
+    # report-backs (a de sucesso dentro de `handle_task`, a de falha em
+    # `_route_failure`), que estao em escopos diferentes.
+    claim_id = uuid.uuid4()
 
     try:
         async with session_scope(settings) as session:
@@ -200,9 +219,18 @@ async def on_message(
                 TaskRepository(session, settings),
                 attempts,
                 processor=processor,
+                claim_id=claim_id,
             )
     except TaskProcessingError as exc:
-        await _route_failure(message, task_message, retry_count, str(exc), settings, publisher)
+        await _route_failure(
+            message,
+            task_message,
+            retry_count,
+            str(exc),
+            settings,
+            publisher,
+            claim_id,
+        )
         return
     except Exception as exc:  # erro inesperado tambem segue a politica de retry/DLX
         logger.exception("unexpected error while handling task")
@@ -213,6 +241,7 @@ async def on_message(
             f"{type(exc).__name__}: {exc}",
             settings,
             publisher,
+            claim_id,
         )
         return
 
