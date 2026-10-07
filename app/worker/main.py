@@ -58,6 +58,35 @@ async def _send_to_dead_letter(
     await message.ack()
 
 
+async def _persist_failure(
+    task_message: TaskMessage,
+    error: str,
+    attempts: int,
+    settings: Settings,
+) -> None:
+    """Grava a falha no banco SEM deixar o erro de persistencia escapar.
+
+    CONTENCAO DELIBERADA: se o Postgres estiver fora, a excecao desta escrita
+    nao pode impedir o `nack` (retry) nem o `publish` na DLX. Sem ack e sem
+    nack a mensagem ficaria segurando um slot de prefetch para sempre, e o
+    consumidor degradaria ate parar.
+    """
+    try:
+        async with session_scope(settings) as session:
+            await TaskRepository(session, settings).mark_failed(
+                task_message.task_id, error, attempts
+            )
+    except Exception as exc:
+        logger.error(
+            "failed to persist task failure",
+            extra={
+                "task_id": str(task_message.task_id),
+                "attempts": attempts,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+
 async def _route_failure(
     message: AbstractIncomingMessage,
     task_message: TaskMessage,
@@ -76,8 +105,7 @@ async def _route_failure(
         "error": error,
     }
 
-    async with session_scope(settings) as session:
-        await TaskRepository(session).mark_failed(task_message.task_id, error, attempts)
+    await _persist_failure(task_message, error, attempts, settings)
 
     if decide(retry_count, settings.task_max_retries) == "RETRY":
         # nack sem requeue: a DLX nativa encaminha para a fila de retry, que
@@ -96,6 +124,47 @@ async def _route_failure(
         publisher=publisher,
     )
     logger.error("task moved to dead letter queue", extra=log_context)
+
+
+async def _route_concurrent_claim(
+    message: AbstractIncomingMessage,
+    task_message: TaskMessage,
+    retry_count: int,
+    settings: Settings,
+    publisher: TaskPublisher,
+) -> None:
+    """Devolve a entrega cujo claim esta em poder de outro consumidor.
+
+    Nao e falha da task, portanto NADA e gravado no banco. O `nack(requeue=False)`
+    manda a mensagem pelo hop de retry: quando ela voltar, o outro consumidor ja
+    terminou (linha COMPLETED => duplicata, ack) ou falhou (linha FAILED =>
+    reclamavel). Dar ack aqui perderia a mensagem para sempre se o claim vivo
+    nunca reportasse de volta.
+    """
+    attempts = retry_count + 1
+    reason = "task claim is held by another consumer"
+    log_context = {
+        "task_id": str(task_message.task_id),
+        "event_type": task_message.event_type,
+        "retry_count": retry_count,
+        "attempts": attempts,
+    }
+
+    if decide(retry_count, settings.task_max_retries) == "RETRY":
+        await message.nack(requeue=False)
+        logger.warning("task claim held by another consumer", extra=log_context)
+        return
+
+    await _send_to_dead_letter(
+        message,
+        headers={
+            X_RETRY_COUNT_HEADER: retry_count,
+            X_ATTEMPTS_HEADER: attempts,
+            X_FAILURE_REASON_HEADER: reason,
+        },
+        publisher=publisher,
+    )
+    logger.error("task moved to dead letter queue", extra={**log_context, "error": reason})
 
 
 async def on_message(
@@ -128,7 +197,7 @@ async def on_message(
         async with session_scope(settings) as session:
             outcome = await handle_task(
                 task_message,
-                TaskRepository(session),
+                TaskRepository(session, settings),
                 attempts,
                 processor=processor,
             )
@@ -145,6 +214,10 @@ async def on_message(
             settings,
             publisher,
         )
+        return
+
+    if outcome == "SKIPPED_CONCURRENT":
+        await _route_concurrent_claim(message, task_message, retry_count, settings, publisher)
         return
 
     await message.ack()

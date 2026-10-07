@@ -21,7 +21,7 @@ from app.db.repository import TaskRepositoryProtocol
 
 logger = logging.getLogger(__name__)
 
-HandleOutcome = Literal["PROCESSED", "SKIPPED_DUPLICATE"]
+HandleOutcome = Literal["PROCESSED", "SKIPPED_DUPLICATE", "SKIPPED_CONCURRENT"]
 
 # Assinatura do callable injetavel (os testes passam um spy contador).
 Processor = Callable[[uuid.UUID, str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -103,9 +103,13 @@ async def handle_task(
     """Processa a task uma unica vez, mesmo com entregas duplicadas.
 
     A GARANTIA DE IDEMPOTENCIA vem do claim atomico feito ANTES de qualquer regra
-    de negocio: se a linha ja esta COMPLETED o repositorio devolve
-    "ALREADY_COMPLETED" e a funcao retorna sem chamar o `processor` -- nenhum
-    efeito colateral e nenhuma segunda escrita.
+    de negocio. So o resultado "CLAIMED" autoriza chamar o `processor`:
+
+    - "ALREADY_COMPLETED": a linha ja terminou (duplicata espacada) -- o
+      chamador da ack e nada e reexecutado.
+    - "LOCKED": outro consumidor detem o claim AGORA (duplicata concorrente, as
+      duas entregas na mesma janela de prefetch) -- o chamador devolve a
+      mensagem para o hop de retry.
 
     `TaskProcessingError` levantada pelo processor sobe para o chamador (o callback
     AMQP), que decide entre retentar e mandar para a dead letter queue.
@@ -125,6 +129,10 @@ async def handle_task(
     if claim == "ALREADY_COMPLETED":
         logger.info("duplicate delivery skipped", extra=log_context)
         return "SKIPPED_DUPLICATE"
+
+    if claim == "LOCKED":
+        logger.warning("concurrent claim skipped", extra=log_context)
+        return "SKIPPED_CONCURRENT"
 
     result = await processor(
         message_data.task_id,

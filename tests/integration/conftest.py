@@ -47,6 +47,12 @@ SKIP_HINT = "suba os servicos com: docker compose up -d postgres rabbitmq"
 TEST_RETRY_TTL_MS = 500
 TEST_PREFETCH_COUNT = 1
 
+# Lease do claim na suite: 4x o TTL de teste e ordens de grandeza acima do
+# processamento (que aqui e instantaneo), o que torna o teste concorrente
+# estavel. Nenhum teste espera o lease expirar -- o caso obsoleto e provocado
+# backdating o claimed_at com um UPDATE direto, deterministico e instantaneo.
+TEST_CLAIM_LEASE_SECONDS = 2.0
+
 WORKER_STARTUP_SECONDS = 0.5
 WORKER_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 DEFAULT_WAIT_TIMEOUT_SECONDS = 10.0
@@ -80,6 +86,7 @@ def settings() -> Settings:
         retry_ttl_ms=TEST_RETRY_TTL_MS,
         processing_delay_seconds=0,
         worker_prefetch_count=TEST_PREFETCH_COUNT,
+        claim_lease_seconds=TEST_CLAIM_LEASE_SECONDS,
     )
 
 

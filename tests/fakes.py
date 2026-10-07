@@ -3,7 +3,7 @@
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aio_pika import DeliveryMode
@@ -32,6 +32,7 @@ def make_task(
     attempts: int = 0,
     result: dict[str, Any] | None = None,
     error: str | None = None,
+    claimed_at: datetime | None = None,
 ) -> Task:
     """Instancia de Task completa (com timestamps) para uso fora do banco."""
     now = _now()
@@ -43,21 +44,34 @@ def make_task(
         attempts=attempts,
         result=result,
         error=error,
+        claimed_at=claimed_at,
         created_at=now,
         updated_at=now,
     )
 
 
 class FakeTaskRepository:
-    """TaskRepositoryProtocol em memoria com a mesma semantica de claim."""
+    """TaskRepositoryProtocol em memoria com a mesma semantica de claim.
 
-    def __init__(self) -> None:
+    Espelha a tabela de verdade de `app/db/repository.py`, lease incluido: um
+    claim PROCESSING ainda dentro de `claim_lease_seconds` devolve "LOCKED".
+    """
+
+    def __init__(self, claim_lease_seconds: float = 5.0) -> None:
         self.rows: dict[uuid.UUID, Task] = {}
+        self.claim_lease_seconds = claim_lease_seconds
 
     def seed(self, task: Task) -> Task:
         """Insere uma linha pronta (atalho de arrange dos testes)."""
         self.rows[task.task_id] = task
         return task
+
+    def expire_claim(self, task_id: uuid.UUID) -> None:
+        """Backdata o `claimed_at` para fora do lease (claim obsoleto).
+
+        Deterministico e instantaneo: nenhum teste precisa dormir o lease.
+        """
+        self.rows[task_id].claimed_at = _now() - timedelta(seconds=self.claim_lease_seconds + 1)
 
     async def claim_for_processing(
         self,
@@ -66,10 +80,13 @@ class FakeTaskRepository:
         payload: dict[str, Any],
         attempts: int,
     ) -> ClaimResult:
-        """Mesma regra do repositorio real: linha COMPLETED nao e reclamada."""
+        """Mesma regra do repositorio real (COMPLETED e lease vivo nao sao reclamados)."""
         existing = self.rows.get(task_id)
-        if existing is not None and existing.status == TaskStatus.COMPLETED:
-            return "ALREADY_COMPLETED"
+        if existing is not None:
+            if existing.status == TaskStatus.COMPLETED:
+                return "ALREADY_COMPLETED"
+            if existing.status == TaskStatus.PROCESSING and self._lease_is_alive(existing):
+                return "LOCKED"
 
         if existing is None:
             self.rows[task_id] = make_task(
@@ -78,18 +95,26 @@ class FakeTaskRepository:
                 payload=payload,
                 status=TaskStatus.PROCESSING,
                 attempts=attempts,
+                claimed_at=_now(),
             )
         else:
             existing.status = TaskStatus.PROCESSING
             existing.attempts = attempts
+            existing.claimed_at = _now()
             existing.updated_at = _now()
         return "CLAIMED"
+
+    def _lease_is_alive(self, task: Task) -> bool:
+        if task.claimed_at is None:
+            return False
+        return _now() - task.claimed_at < timedelta(seconds=self.claim_lease_seconds)
 
     async def mark_completed(self, task_id: uuid.UUID, result: dict[str, Any]) -> None:
         task = self.rows[task_id]
         task.status = TaskStatus.COMPLETED
         task.result = result
         task.error = None
+        task.claimed_at = None
         task.updated_at = _now()
 
     async def mark_failed(self, task_id: uuid.UUID, error: str, attempts: int) -> None:
@@ -97,10 +122,40 @@ class FakeTaskRepository:
         task.status = TaskStatus.FAILED
         task.error = error
         task.attempts = attempts
+        task.claimed_at = None
         task.updated_at = _now()
 
     async def get(self, task_id: uuid.UUID) -> Task | None:
         return self.rows.get(task_id)
+
+
+class FakeIncomingMessage:
+    """Substitui AbstractIncomingMessage registrando os ack/nack recebidos."""
+
+    def __init__(
+        self,
+        body: bytes,
+        headers: dict[str, Any] | None = None,
+        exchange: str = "",
+        routing_key: str = "",
+    ) -> None:
+        self.body = body
+        self.headers: dict[str, Any] = headers if headers is not None else {}
+        self.exchange = exchange
+        self.routing_key = routing_key
+        self.acks = 0
+        self.nacks: list[bool] = []
+
+    @property
+    def settled(self) -> int:
+        """Quantas vezes a mensagem foi resolvida (ack + nack)."""
+        return self.acks + len(self.nacks)
+
+    async def ack(self) -> None:
+        self.acks += 1
+
+    async def nack(self, requeue: bool = True) -> None:
+        self.nacks.append(requeue)
 
 
 @dataclass(frozen=True, slots=True)

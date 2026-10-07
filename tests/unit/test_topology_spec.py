@@ -84,9 +84,7 @@ def test_bindings_use_the_configured_routing_keys() -> None:
 
 def test_topology_prefix_is_applied_to_all_six_names() -> None:
     spec = build_topology(_settings(topology_prefix="test_"))
-    names = [exchange.name for exchange in spec.exchanges] + [
-        queue.name for queue in spec.queues
-    ]
+    names = [exchange.name for exchange in spec.exchanges] + [queue.name for queue in spec.queues]
     assert names == [
         "test_tasks.exchange",
         "test_tasks.retry.exchange",

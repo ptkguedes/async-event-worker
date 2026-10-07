@@ -43,8 +43,24 @@ services:
         INSTALL_DEV: "true"
     command: sh -c "alembic upgrade head && uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload"
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app:app@postgres:5432/async_event_worker}
-      AMQP_URL: ${AMQP_URL:-amqp://guest:guest@rabbitmq:5672/}
+      # Variaveis RAIZ: as MESMAS que os servicos postgres e rabbitmq recebem,
+      # por isso trocar uma senha em um unico lugar vale para toda a stack.
+      # app/core/config.py deriva DATABASE_URL e AMQP_URL a partir delas.
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-async_event_worker}
+      # Literais: dentro da rede do Compose o host e o nome do servico e a porta
+      # e a interna. ${POSTGRES_PORT} e a porta PUBLICADA no host, outra coisa.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+      # Override opcional: vazio => URL derivada das variaveis acima.
+      DATABASE_URL: ${DATABASE_URL:-}
+      AMQP_URL: ${AMQP_URL:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-local}
       TASK_MAX_RETRIES: ${TASK_MAX_RETRIES:-3}
@@ -76,14 +92,26 @@ services:
         INSTALL_DEV: "true"
     command: python -m app.worker.main
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app:app@postgres:5432/async_event_worker}
-      AMQP_URL: ${AMQP_URL:-amqp://guest:guest@rabbitmq:5672/}
+      # Mesmas variaveis raiz do servico api (ver comentario la).
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-async_event_worker}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+      DATABASE_URL: ${DATABASE_URL:-}
+      AMQP_URL: ${AMQP_URL:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-local}
       TASK_MAX_RETRIES: ${TASK_MAX_RETRIES:-3}
       RETRY_TTL_MS: ${RETRY_TTL_MS:-5000}
       WORKER_PREFETCH_COUNT: ${WORKER_PREFETCH_COUNT:-10}
       PROCESSING_DELAY_SECONDS: ${PROCESSING_DELAY_SECONDS:-0.5}
+      CLAIM_LEASE_SECONDS: ${CLAIM_LEASE_SECONDS:-5.0}
     volumes:
       - .:/app
     depends_on:

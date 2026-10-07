@@ -72,14 +72,49 @@ async def test_failed_task_is_processed_on_the_next_delivery(
 
     with pytest.raises(TaskProcessingError):
         await handle_task(_message(task_id), fake_repository, attempts=1, processor=processor)
-    outcome = await handle_task(
-        _message(task_id), fake_repository, attempts=2, processor=processor
-    )
+    # O que `_route_failure` faz no fluxo real: grava FAILED e libera o claim.
+    await fake_repository.mark_failed(task_id, "forced failure on attempt 1", attempts=1)
+
+    outcome = await handle_task(_message(task_id), fake_repository, attempts=2, processor=processor)
 
     assert outcome == "PROCESSED"
     assert processor.count == 2
     assert fake_repository.rows[task_id].status == TaskStatus.COMPLETED
     assert fake_repository.rows[task_id].attempts == 2
+
+
+async def test_concurrent_delivery_is_skipped_while_the_claim_lease_is_alive(
+    fake_repository: FakeTaskRepository,
+) -> None:
+    """Claim vivo de outro consumidor: a segunda entrega nao executa nada."""
+    task_id = uuid.uuid4()
+    processor = CountingProcessor()
+
+    # Claim do "outro consumidor": a linha fica PROCESSING com lease fresco.
+    assert await fake_repository.claim_for_processing(task_id, "demo", {}, 1) == "CLAIMED"
+
+    outcome = await handle_task(_message(task_id), fake_repository, attempts=1, processor=processor)
+
+    assert outcome == "SKIPPED_CONCURRENT"
+    assert processor.count == 0
+    assert fake_repository.rows[task_id].status == TaskStatus.PROCESSING
+    assert fake_repository.rows[task_id].result is None
+
+
+async def test_stale_claim_is_reclaimed_after_the_lease_expires(
+    fake_repository: FakeTaskRepository,
+) -> None:
+    """Claim obsoleto (worker morto) nao bloqueia a task para sempre."""
+    task_id = uuid.uuid4()
+    processor = CountingProcessor()
+    await fake_repository.claim_for_processing(task_id, "demo", {}, 1)
+
+    fake_repository.expire_claim(task_id)
+    outcome = await handle_task(_message(task_id), fake_repository, attempts=2, processor=processor)
+
+    assert outcome == "PROCESSED"
+    assert processor.count == 1
+    assert fake_repository.rows[task_id].status == TaskStatus.COMPLETED
 
 
 async def test_simulate_processing_fails_when_payload_forces_failure(

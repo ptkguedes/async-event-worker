@@ -28,6 +28,10 @@ class Task(Base):
 
     `task_id` e a PRIMARY KEY: e ela que garante a idempotencia, porque o claim
     usa INSERT ... ON CONFLICT (task_id) em uma unica instrucao atomica.
+
+    `claimed_at` e o LEASE desse claim: enquanto estiver fresca a linha
+    PROCESSING pertence a um consumidor; expirado o lease, a linha volta a ser
+    reclamavel (worker morto ou tentativa que nunca reportou).
     """
 
     __tablename__ = "tasks"
@@ -45,6 +49,8 @@ class Task(Base):
         index=True,
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # NULL = nenhum claim pendente (linha nova, COMPLETED ou FAILED).
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     result: Mapped[dict[str, Any] | None] = mapped_column(postgresql.JSONB, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
