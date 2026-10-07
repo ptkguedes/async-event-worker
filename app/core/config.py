@@ -53,16 +53,22 @@ class Settings(BaseSettings):
     # Timeouts de I/O do banco. Sem eles um Postgres que aceita o TCP e nunca
     # responde penduraria o callback do worker antes de qualquer ack/nack,
     # segurando um slot de prefetch para sempre.
-    # 5.0s para abrir conexao: na rede do Compose isso leva milissegundos, e e
-    # o mesmo teto que a suite de integracao usa para decidir "indisponivel".
-    db_connect_timeout_seconds: float = Field(5.0, gt=0)
-    # 10s por statement: toda instrucao da app e single-row pela PRIMARY KEY
+    # 3.0s para abrir conexao: na rede do Compose isso leva milissegundos.
+    db_connect_timeout_seconds: float = Field(3.0, gt=0)
+    # 5s por statement: toda instrucao da app e single-row pela PRIMARY KEY
     # (upsert do claim, UPDATE da report-back, SELECT do GET), ordem de
     # milissegundos -- 3 ordens de grandeza de folga, entao nenhum teste floca.
     # Ao mesmo tempo o pior caso de retencao de uma mensagem antes do ack/nack
-    # passa a ser limitado (~5s + ~10s) em vez de infinito, e muito abaixo do
+    # passa a ser limitado (~3s + ~5s) em vez de infinito, e muito abaixo do
     # `consumer_timeout` default do RabbitMQ (30 min).
-    db_statement_timeout_ms: int = Field(10_000, gt=0)
+    #
+    # INVARIANTE: a soma destes dois (8s) e o teto do tempo que UM worker pode
+    # passar dentro da secao critica por causa de I/O de banco, e ela precisa
+    # caber DENTRO de `claim_lease_seconds`. Se a lease fosse menor, um worker
+    # legitimamente lento perderia o claim, outro consumidor reclamaria a linha
+    # e o efeito colateral rodaria duas vezes -- o fencing manteria o banco
+    # consistente, mas a idempotencia do efeito colateral ja teria sido quebrada.
+    db_statement_timeout_ms: int = Field(5_000, gt=0)
 
     # Broker: idem, os aliases sao os nomes que a imagem do RabbitMQ ja usa.
     rabbitmq_user: str = Field("guest", validation_alias="RABBITMQ_DEFAULT_USER")
@@ -85,19 +91,34 @@ class Settings(BaseSettings):
     retry_routing_key: str = "tasks.retry"
     dlx_routing_key: str = "tasks.dead"
 
-    # Resiliencia: 3 retentativas automaticas (4 processamentos no total) antes da DLX
+    # Resiliencia: 3 retentativas automaticas (4 processamentos no total) antes da DLX.
+    #
+    # O TTL e `x-message-ttl` da fila de retry, logo ele tambem define QUANDO
+    # cada reentrega chega: ~0s, 10s, 20s, 30s. Isso precisa ser folgado em
+    # relacao a `claim_lease_seconds` (15s): se um worker morre segurando o
+    # claim, a lease expira em 15s e a 3a entrega (20s) consegue reclamar a
+    # linha, ainda sobrando a 4a. Com um TTL curto demais todas as entregas
+    # bateriam num claim vivo e a task iria para a DLX sem nunca ser processada.
     task_max_retries: int = 3
-    retry_ttl_ms: int = 5000
+    retry_ttl_ms: int = 10_000
 
     # Worker
     worker_prefetch_count: int = 10
     processing_delay_seconds: float = 0.5
-    # Duracao do lease do claim idempotente. Regra: lease >= duracao maxima do
-    # processamento (senao um claim vivo seria considerado obsoleto) e
-    # lease <= retry_ttl_ms (senao um claim deixado por um worker morto so
-    # voltaria a ser reclamavel depois do orcamento de retentativas acabar,
-    # mandando para a DLX uma task que nunca falhou).
-    claim_lease_seconds: float = Field(5.0, gt=0)
+    # Duracao do lease do claim idempotente, presa entre dois limites:
+    #
+    # PISO: lease > db_connect_timeout_seconds + db_statement_timeout_ms (8s).
+    #   A lease tem de cobrir o pior caso de um worker lento por I/O de banco,
+    #   senao ele perde o claim ainda processando, outro consumidor reclama a
+    #   linha e o efeito colateral roda duas vezes.
+    #
+    # TETO: lease < 2 * retry_ttl_ms (20s).
+    #   Um claim deixado por um worker morto tem de expirar com tempo de sobra
+    #   dentro do orcamento de retentativas. Com entregas em ~0s/10s/20s/30s,
+    #   uma lease de 15s libera a linha antes da 3a entrega e ainda deixa a 4a
+    #   em reserva. Se a lease passasse do orcamento inteiro, a task iria para
+    #   a DLX sem nunca ter sido processada.
+    claim_lease_seconds: float = Field(15.0, gt=0)
 
     @model_validator(mode="after")
     def _derive_urls(self) -> "Settings":

@@ -51,7 +51,7 @@ flowchart LR
     worker["Worker<br/>consumer com ack manual"]
     db[("PostgreSQL<br/>tabela tasks")]
     rx{{"tasks.retry.exchange<br/>(DLX nativa da fila tasks)"}}
-    rq[["fila tasks.retry<br/>x-message-ttl = 5000ms"]]
+    rq[["fila tasks.retry<br/>x-message-ttl = 10000ms"]]
     dx{{"tasks.dlx.exchange"}}
     dq[["fila dlx_tasks<br/>(terminal)"]]
 
@@ -90,7 +90,7 @@ divergem. Todos os nomes e valores vem de `Settings` (`app/core/config.py`).
 | Fila | `x-queue-type` | `x-message-ttl` | `x-dead-letter-exchange` | `x-dead-letter-routing-key` | Durable |
 |---|---|---|---|---|---|
 | `tasks` | `classic` | — | `tasks.retry.exchange` | `tasks.retry` | sim |
-| `tasks.retry` | `classic` | `5000` (`RETRY_TTL_MS`) | `tasks.exchange` | `tasks.process` | sim |
+| `tasks.retry` | `classic` | `10000` (`RETRY_TTL_MS`) | `tasks.exchange` | `tasks.process` | sim |
 | `dlx_tasks` | `classic` | — | **nenhum (de proposito)** | — | sim |
 
 `dlx_tasks` e **terminal**: nao tem `x-dead-letter-exchange`. Se tivesse, a mensagem morta
@@ -180,10 +180,15 @@ RETURNING task_id;
 `SELECT` antes do `UPDATE`, portanto nao existe janela de corrida: leitura e escrita sao a mesma
 instrucao, avaliada pelo relogio do banco.
 
-`claimed_at` e o **lease** do claim (`CLAIM_LEASE_SECONDS`, default `5.0`): ela diz por quanto
-tempo uma linha `PROCESSING` pertence ao consumidor que a reclamou. O invariante
-**`CLAIM_LEASE_SECONDS >= PROCESSING_DELAY_SECONDS`** (default: 5.0 >= 0.5, 10x de folga) e o que
-mantem a janela de execucao dupla fechada: enquanto o processamento cabe dentro do lease, o claim
+`claimed_at` e o **lease** do claim (`CLAIM_LEASE_SECONDS`, default `15.0`): ela diz por quanto
+tempo uma linha `PROCESSING` pertence ao consumidor que a reclamou. O que
+mantem a janela de execucao dupla fechada e o lease cobrir o **pior caso** de duracao de um
+processamento, e esse pior caso nao e o `PROCESSING_DELAY_SECONDS` (0.5s): e o teto de I/O de
+banco, `DB_CONNECT_TIMEOUT_SECONDS + DB_STATEMENT_TIMEOUT_MS/1000` = 8s. Daí o invariante
+
+**`CLAIM_LEASE_SECONDS > DB_CONNECT_TIMEOUT_SECONDS + DB_STATEMENT_TIMEOUT_MS/1000`**
+
+(default: 15.0 > 8.0). Enquanto o processamento cabe dentro do lease, o claim
 de uma entrega viva nunca e considerado obsoleto por outra. Sem o lease, duas entregas do
 mesmo `task_id` na mesma janela de prefetch veriam as duas a linha "ainda nao COMPLETED" e
 executariam o efeito colateral duas vezes. Com o lease, os tres resultados possiveis sao:
@@ -240,8 +245,9 @@ a cadeia de retry/DLX de uma task que realmente falha nao muda em nada, porque a
 report-back acontecem na mesma entrega, milissegundos depois, dentro do lease.
 
 O fencing protege a **linha**, nao desfaz o efeito colateral: se o lease vencer e dois workers
-processarem, os dois efeitos aconteceram. Reduzir essa janela e papel do invariante
-`CLAIM_LEASE_SECONDS >= PROCESSING_DELAY_SECONDS`.
+processarem, os dois efeitos aconteceram. Fechar essa janela e papel do invariante
+`CLAIM_LEASE_SECONDS > DB_CONNECT_TIMEOUT_SECONDS + DB_STATEMENT_TIMEOUT_MS/1000`: enquanto o
+teto de I/O de banco cabe dentro do lease, nenhum worker legitimamente lento perde o claim.
 
 ### Timeouts do banco
 
@@ -251,8 +257,15 @@ de prefetch para sempre:
 
 | Variavel | Default | Onde vigora |
 |---|---|---|
-| `DB_CONNECT_TIMEOUT_SECONDS` | `5.0` | parametro `timeout` do `asyncpg.connect` (estabelecimento da conexao); estourado, levanta `TimeoutError` |
-| `DB_STATEMENT_TIMEOUT_MS` | `10000` | GUC `statement_timeout` do Postgres, via `server_settings` (milissegundos, como string); estourado, levanta `DBAPIError` com sqlstate `57014` e **nao** invalida a conexao |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `3.0` | parametro `timeout` do `asyncpg.connect` (estabelecimento da conexao); estourado, levanta `TimeoutError` |
+| `DB_STATEMENT_TIMEOUT_MS` | `5000` | GUC `statement_timeout` do Postgres, via `server_settings` (milissegundos, como string); estourado, levanta `DBAPIError` com sqlstate `57014` e **nao** invalida a conexao |
+
+A **soma** dos dois (8s) importa mais que cada um isolado: ela e o teto do tempo que um worker
+pode passar preso em I/O dentro da secao critica, e por isso tem de caber dentro de
+`CLAIM_LEASE_SECONDS` (15s). A ordenacao inversa -- timeout maior que o lease -- deixaria uma
+janela em que o claim expira com o worker ainda processando, outro consumidor reclama a linha e o
+efeito colateral roda duas vezes. O fencing manteria o banco consistente, mas a idempotencia do
+efeito colateral ja teria sido quebrada.
 
 Um terceiro valor, `command_timeout`, e derivado de `DB_STATEMENT_TIMEOUT_MS` com 1s de margem: e
 o teto do lado cliente, para o caso em que nenhum timeout do servidor chega a disparar. A margem
@@ -378,10 +391,10 @@ curl -s -X POST localhost:8000/api/v1/tasks \
   -d '{"event_type":"demo.fail","payload":{"force_failure":true}}'
 
 # 2) acompanhe o worker: 3 linhas "task rejected for retry" (retry_count 0, 1, 2),
-#    com ~5s de intervalo (o x-message-ttl), e depois "task moved to dead letter queue"
+#    com ~10s de intervalo (o x-message-ttl), e depois "task moved to dead letter queue"
 docker compose logs -f worker     # ou: make logs
 
-# 3) confira as filas (~15s depois): dlx_tasks = 1, tasks = 0, tasks.retry = 0
+# 3) confira as filas (~30s depois): dlx_tasks = 1, tasks = 0, tasks.retry = 0
 docker compose exec rabbitmq rabbitmqctl list_queues name messages     # ou: make dlq
 ```
 
@@ -504,8 +517,8 @@ derivado.
 | `POSTGRES_HOST` | `postgres` | host de conexao (`localhost` ao rodar fora dos containers) |
 | `POSTGRES_PORT` | `5432` | porta publicada no host pelo Compose |
 | `DATABASE_URL` | derivada das 5 acima | override opcional da conexao async do SQLAlchemy |
-| `DB_CONNECT_TIMEOUT_SECONDS` | `5.0` | teto para ABRIR a conexao com o Postgres |
-| `DB_STATEMENT_TIMEOUT_MS` | `10000` | teto por statement (GUC `statement_timeout`); nao afeta as migrations |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `3.0` | teto para ABRIR a conexao com o Postgres |
+| `DB_STATEMENT_TIMEOUT_MS` | `5000` | teto por statement (GUC `statement_timeout`); nao afeta as migrations |
 | `RABBITMQ_DEFAULT_USER` | `guest` | usuario do RabbitMQ (container e aplicacao) |
 | `RABBITMQ_DEFAULT_PASS` | `guest` | senha do RabbitMQ; percent-encoded na derivacao da URL |
 | `RABBITMQ_HOST` | `rabbitmq` | host do broker (`localhost` fora dos containers) |
@@ -513,10 +526,10 @@ derivado.
 | `RABBITMQ_VHOST` | `/` | vhost; `/` ou vazio = URL terminando em `/` |
 | `AMQP_URL` | derivada das 5 acima | override opcional da conexao do RabbitMQ |
 | `TASK_MAX_RETRIES` | `3` | retentativas antes da DLX (4 processamentos) |
-| `RETRY_TTL_MS` | `5000` | atraso entre retentativas (`x-message-ttl`) |
+| `RETRY_TTL_MS` | `10000` | atraso entre retentativas (`x-message-ttl`); entregas em ~0s/10s/20s/30s |
 | `WORKER_PREFETCH_COUNT` | `10` | mensagens em voo por consumidor (QoS) |
 | `PROCESSING_DELAY_SECONDS` | `0.5` | duracao do processamento simulado |
-| `CLAIM_LEASE_SECONDS` | `5.0` | lease do claim idempotente; regra: `>= PROCESSING_DELAY_SECONDS` e `<= RETRY_TTL_MS/1000` |
+| `CLAIM_LEASE_SECONDS` | `15.0` | lease do claim idempotente; regra: `> DB_CONNECT_TIMEOUT_SECONDS + DB_STATEMENT_TIMEOUT_MS/1000` e `< 2 * RETRY_TTL_MS/1000` |
 | `TOPOLOGY_PREFIX` | vazio | prefixo de todos os nomes de fila/exchange (a suite de integracao usa `test_`) |
 | `LOG_LEVEL` | `INFO` | nivel do logging JSON em stdout |
 

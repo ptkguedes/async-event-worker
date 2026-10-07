@@ -52,7 +52,7 @@ def test_retry_queue_waits_the_ttl_and_returns_to_the_tasks_exchange() -> None:
     arguments = _queues_by_name(_settings())["tasks.retry"]
     assert arguments == {
         "x-queue-type": "classic",
-        "x-message-ttl": 5000,
+        "x-message-ttl": 10_000,
         "x-dead-letter-exchange": "tasks.exchange",
         "x-dead-letter-routing-key": "tasks.process",
     }

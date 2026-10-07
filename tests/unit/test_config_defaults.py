@@ -65,7 +65,7 @@ def test_routing_key_defaults() -> None:
 def test_resilience_defaults() -> None:
     settings = _settings()
     assert settings.task_max_retries == 3
-    assert settings.retry_ttl_ms == 5000
+    assert settings.retry_ttl_ms == 10_000
 
 
 def test_empty_prefix_keeps_names_unchanged() -> None:
@@ -92,12 +92,26 @@ def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
 
 
-def test_claim_lease_default_fits_between_processing_and_retry_ttl() -> None:
+def test_claim_lease_default_sits_above_the_db_timeouts_and_below_the_retry_budget() -> None:
     settings = _settings()
-    assert settings.claim_lease_seconds == 5.0
-    # A regra que faz o lease nao estragar nem o processamento nem o retry.
+    assert settings.claim_lease_seconds == 15.0
+
+    # PISO: a lease cobre o pior caso de I/O de banco de UM worker. Se ela
+    # fosse menor que a soma dos timeouts, um worker legitimamente lento
+    # perderia o claim ainda processando e outro consumidor rodaria o efeito
+    # colateral de novo -- o fencing protege o banco, nao o efeito colateral.
+    db_io_ceiling_seconds = (
+        settings.db_connect_timeout_seconds + settings.db_statement_timeout_ms / 1000
+    )
+    assert settings.claim_lease_seconds > db_io_ceiling_seconds
+
+    # E obviamente acima do proprio processamento simulado.
     assert settings.claim_lease_seconds >= settings.processing_delay_seconds
-    assert settings.claim_lease_seconds <= settings.retry_ttl_ms / 1000
+
+    # TETO: um claim deixado por um worker morto tem de expirar com folga
+    # dentro do orcamento de retentativas. Com entregas em ~0s/10s/20s/30s, a
+    # lease precisa cair antes da 3a para a 4a sobrar de reserva.
+    assert settings.claim_lease_seconds < 2 * settings.retry_ttl_ms / 1000
 
 
 def test_claim_lease_must_be_positive() -> None:
@@ -107,11 +121,17 @@ def test_claim_lease_must_be_positive() -> None:
 
 def test_database_timeout_defaults() -> None:
     settings = _settings()
-    assert settings.db_connect_timeout_seconds == 5.0
-    assert settings.db_statement_timeout_ms == 10_000
-    # Folga sobre o maior statement da app (single-row pela PRIMARY KEY) e
-    # sobre o lease do claim, para que o timeout nao estrangule o fluxo normal.
-    assert settings.db_statement_timeout_ms / 1000 > settings.claim_lease_seconds
+    assert settings.db_connect_timeout_seconds == 3.0
+    assert settings.db_statement_timeout_ms == 5_000
+    # Folga sobre o maior statement da app (single-row pela PRIMARY KEY, ordem
+    # de milissegundos), mas ABAIXO do lease do claim: a soma dos dois timeouts
+    # e o teto do tempo que um worker pode ficar preso em I/O, e esse teto tem
+    # de caber dentro da lease. A ordenacao inversa (statement > lease) deixava
+    # uma janela em que o claim expirava com o worker ainda processando.
+    db_io_ceiling_seconds = (
+        settings.db_connect_timeout_seconds + settings.db_statement_timeout_ms / 1000
+    )
+    assert db_io_ceiling_seconds < settings.claim_lease_seconds
 
 
 def test_database_timeouts_must_be_positive() -> None:
