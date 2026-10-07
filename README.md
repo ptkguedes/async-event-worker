@@ -33,10 +33,11 @@ app/
   core/      config.py, topology.py, broker.py, logging.py, constants.py, exceptions.py
   db/        base.py, models.py, session.py, repository.py
 alembic/     env.py (async) + versions/0001_create_tasks_table.py,
-             versions/0002_add_claimed_at_to_tasks.py
+             versions/0002_add_claimed_at_to_tasks.py,
+             versions/0003_add_claim_id_to_tasks.py
 tests/
-  unit/          7 arquivos, sem servico externo (fakes em memoria)
-  integration/   conftest.py + os 3 fluxos (RabbitMQ e Postgres reais)
+  unit/          9 arquivos, sem servico externo (fakes em memoria)
+  integration/   conftest.py + os fluxos de sucesso, idempotencia, DLX e timeouts
 ```
 
 ### Fluxo das mensagens
@@ -133,8 +134,10 @@ total.** `decide(retry_count, max_retries)` devolve `DEAD_LETTER` quando
 Resultado final de uma task que falha sempre: **1 mensagem em `dlx_tasks`** e a linha no banco
 com `status = FAILED` e `attempts = 4`.
 
-`mark_failed` grava `FAILED` e **zera `claimed_at`**: a entrega da retentativa seguinte encontra
-uma linha sem claim pendente e a reclama na hora, sem esperar o lease expirar. A escrita de
+`mark_failed` grava `FAILED` e **zera `claimed_at` e `claim_id`**: a entrega da retentativa
+seguinte encontra uma linha sem claim pendente e a reclama na hora, sem esperar o lease expirar.
+Zerar o token tambem deixa a report-back **at-most-once**: repetir a mesma chamada nao casa a
+linha de novo. A escrita de
 `mark_failed` roda num bloco defensivo -- se o Postgres estiver fora ela so loga
 `failed to persist task failure` e o `nack`/`publish` na DLX acontece de qualquer forma, porque
 uma mensagem sem ack e sem nack seguraria um slot de prefetch para sempre.
@@ -158,12 +161,13 @@ O **corpo original** da mensagem e preservado intacto, para permitir reprocessam
 executa um claim atomico em uma unica instrucao:
 
 ```sql
-INSERT INTO tasks (task_id, event_type, payload, status, attempts, claimed_at)
-VALUES (:task_id, :event_type, :payload, 'PROCESSING', :attempts, now())
+INSERT INTO tasks (task_id, event_type, payload, status, attempts, claimed_at, claim_id)
+VALUES (:task_id, :event_type, :payload, 'PROCESSING', :attempts, now(), :claim_id)
 ON CONFLICT (task_id) DO UPDATE
    SET status     = 'PROCESSING',
        attempts   = :attempts,
        claimed_at = now(),
+       claim_id   = :claim_id,
        updated_at = now()
  WHERE tasks.status <> 'COMPLETED'
    AND (tasks.status <> 'PROCESSING'
@@ -177,7 +181,10 @@ RETURNING task_id;
 instrucao, avaliada pelo relogio do banco.
 
 `claimed_at` e o **lease** do claim (`CLAIM_LEASE_SECONDS`, default `5.0`): ela diz por quanto
-tempo uma linha `PROCESSING` pertence ao consumidor que a reclamou. Sem o lease, duas entregas do
+tempo uma linha `PROCESSING` pertence ao consumidor que a reclamou. O invariante
+**`CLAIM_LEASE_SECONDS >= PROCESSING_DELAY_SECONDS`** (default: 5.0 >= 0.5, 10x de folga) e o que
+mantem a janela de execucao dupla fechada: enquanto o processamento cabe dentro do lease, o claim
+de uma entrega viva nunca e considerado obsoleto por outra. Sem o lease, duas entregas do
 mesmo `task_id` na mesma janela de prefetch veriam as duas a linha "ainda nao COMPLETED" e
 executariam o efeito colateral duas vezes. Com o lease, os tres resultados possiveis sao:
 
@@ -197,6 +204,64 @@ vivo nunca reportasse de volta (Postgres fora no meio do caminho de falha, por e
 `COMPLETED` (vira duplicata, ack) ou `FAILED` (reclamavel). O custo e **1 hop do orcamento de
 retentativas** e ~`RETRY_TTL_MS` de atraso no ack da duplicata; se o claim ainda estiver ativo no
 ultimo hop, a mensagem vai para `dlx_tasks` -- nunca perda silenciosa.
+
+### Fencing das report-backs (`claim_id`)
+
+O lease resolve quem **entra** na secao critica, mas nao quem **escreve** no fim. Se o worker A
+travar, o lease vencer e o worker B reclamar a linha, A pode acordar depois e reportar de volta --
+e, escrevendo so por `task_id`, sobrescreveria o estado de B (um `mark_failed` atrasado chega a
+transformar um `COMPLETED` em `FAILED` reclamavel).
+
+A coluna `claim_id` (UUID, migration `0003`) e o **token de fencing**: um valor novo a cada claim.
+As duas escritas de estado final sao atomicamente condicionais a ele, sem nenhum `SELECT` antes:
+
+```sql
+UPDATE tasks
+   SET status = 'COMPLETED', result = :result, error = NULL,
+       claimed_at = NULL, claim_id = NULL, updated_at = now()
+ WHERE task_id = :task_id AND claim_id = :claim_id AND status = 'PROCESSING'
+RETURNING task_id;
+```
+
+Um predicado de lease (`claimed_at > now() - lease`) **nao** serviria: depois do re-claim de B o
+`claimed_at` esta fresco de novo e a escrita de A passaria. Com o token basta `TA <> TB`, sem
+depender de relogio nem de skew. Os tres resultados possiveis:
+
+| Resultado | Significado | O que o worker faz |
+|---|---|---|
+| `WRITTEN` | a linha era desta reserva e recebeu o estado final | segue o fluxo normal (ack no sucesso; `nack`/DLX na falha) |
+| `CLAIM_LOST` | outro consumidor detem o claim agora, ou ja finalizou a linha | **ack**, sem `nack` e sem publish na DLX, mais um WARNING -- o dono atual tem a propria entrega para resolver a task, entao `nack` seria retentativa duplicada e DLX seria dead letter espurio |
+| `MISSING` | nao existe linha, ou seja ninguem detem a task | caminho normal de retry/DLX: dar ack aqui perderia a mensagem |
+
+A rejeicao **nunca** e silenciosa: `task claim lost before completion` (caminho de sucesso, com o
+outcome proprio `SKIPPED_CLAIM_LOST`) e `task claim lost before the failure report` (caminho de
+falha) saem como WARNING com o `task_id`. E ela chega como **valor de retorno**, nao como excecao:
+a cadeia de retry/DLX de uma task que realmente falha nao muda em nada, porque ali o claim e a
+report-back acontecem na mesma entrega, milissegundos depois, dentro do lease.
+
+O fencing protege a **linha**, nao desfaz o efeito colateral: se o lease vencer e dois workers
+processarem, os dois efeitos aconteceram. Reduzir essa janela e papel do invariante
+`CLAIM_LEASE_SECONDS >= PROCESSING_DELAY_SECONDS`.
+
+### Timeouts do banco
+
+A engine da aplicacao (`app/db/session.py`) define dois tetos, porque um Postgres que aceita o TCP
+e nunca responde penduraria o callback do worker **antes** de qualquer ack/nack, segurando um slot
+de prefetch para sempre:
+
+| Variavel | Default | Onde vigora |
+|---|---|---|
+| `DB_CONNECT_TIMEOUT_SECONDS` | `5.0` | parametro `timeout` do `asyncpg.connect` (estabelecimento da conexao); estourado, levanta `TimeoutError` |
+| `DB_STATEMENT_TIMEOUT_MS` | `10000` | GUC `statement_timeout` do Postgres, via `server_settings` (milissegundos, como string); estourado, levanta `DBAPIError` com sqlstate `57014` e **nao** invalida a conexao |
+
+Um terceiro valor, `command_timeout`, e derivado de `DB_STATEMENT_TIMEOUT_MS` com 1s de margem: e
+o teto do lado cliente, para o caso em que nenhum timeout do servidor chega a disparar. A margem
+faz com que, em operacao normal, o cancelamento venha do servidor (mensagem mais informativa).
+
+**As migrations nao sao afetadas.** O `alembic/env.py` monta a propria engine com
+`async_engine_from_config` e nunca importa `app/db/session.py`, portanto um DDL longo roda com o
+`statement_timeout` default do servidor (`0`, desligado) e nao pode ser morto no meio. Ha um teste
+de integracao que monta a engine do mesmo jeito que o Alembic monta e verifica isso.
 
 ---
 
@@ -381,8 +446,10 @@ Os fluxos cobertos:
 |---|---|---|
 | `test_success_flow.py` | sucesso | a task chega a `COMPLETED` com `result` preenchido, `error` nulo, `attempts == 1` e nada em `test_dlx_tasks`. |
 | `test_idempotency.py` | idempotencia (duplicata espacada) | duas entregas do mesmo `task_id` produzem **1 linha**, `attempts == 1`, e o `result` e o da primeira entrega (a duplicata recebeu ack sem reexecutar). |
-| `test_idempotency.py` | idempotencia **concorrente** | duas `handle_task` do mesmo `task_id` em `asyncio.gather` (entregas sobrepostas): o spy compartilhado conta **exatamente 1** execucao do efeito colateral, um outcome `PROCESSED` e o outro pulado. |
+| `test_idempotency.py` | idempotencia **concorrente** | duas `handle_task` do mesmo `task_id` em `asyncio.gather`, sincronizadas por `asyncio.Event` (o worker 1 fica preso dentro da secao critica ate o worker 2 ter tentado o claim): o spy compartilhado conta **exatamente 1** execucao, o outcome do worker 1 e `PROCESSED` e o do worker 2 e **obrigatoriamente** `SKIPPED_CONCURRENT`. Sem `asyncio.sleep`: as esperas tem teto e falham explicadas. |
 | `test_idempotency.py` | lease do claim | claim dentro do lease devolve `LOCKED`; depois de *backdating* o `claimed_at`, o claim volta a `CLAIMED`; `COMPLETED` segue `ALREADY_COMPLETED`. |
+| `test_idempotency.py` | **fencing** do `claim_id` | lease vencido + re-claim por outro consumidor: as duas report-backs do worker zumbi devolvem `CLAIM_LOST` e a linha segue refletindo o dono vivo, inclusive depois de ele gravar `COMPLETED`. |
+| `test_db_timeouts.py` | **timeouts do banco** | o GUC lido de volta do servidor prova que o `connect_args` vigorou; `select pg_sleep(...)` acima do timeout levanta `DBAPIError` com sqlstate `57014` sem invalidar a conexao; e a engine montada como o `alembic/env.py` monta reporta `statement_timeout = 0` (migration nao pode ser morta no meio). |
 | `test_dlx_routing.py` | DLX | exatamente **1 mensagem** em `test_dlx_tasks` com `x-attempts == 4` e `x-retry-count == 3`, linha `FAILED` com `attempts == 4`, filas de trabalho e de retry vazias. |
 
 Lint e formatacao:
@@ -437,6 +504,8 @@ derivado.
 | `POSTGRES_HOST` | `postgres` | host de conexao (`localhost` ao rodar fora dos containers) |
 | `POSTGRES_PORT` | `5432` | porta publicada no host pelo Compose |
 | `DATABASE_URL` | derivada das 5 acima | override opcional da conexao async do SQLAlchemy |
+| `DB_CONNECT_TIMEOUT_SECONDS` | `5.0` | teto para ABRIR a conexao com o Postgres |
+| `DB_STATEMENT_TIMEOUT_MS` | `10000` | teto por statement (GUC `statement_timeout`); nao afeta as migrations |
 | `RABBITMQ_DEFAULT_USER` | `guest` | usuario do RabbitMQ (container e aplicacao) |
 | `RABBITMQ_DEFAULT_PASS` | `guest` | senha do RabbitMQ; percent-encoded na derivacao da URL |
 | `RABBITMQ_HOST` | `rabbitmq` | host do broker (`localhost` fora dos containers) |
@@ -488,12 +557,15 @@ ambiente que nao seja dev local, defina `POSTGRES_USER`, `POSTGRES_PASSWORD`,
 segredos) e nunca commite o `.env`. `DATABASE_URL`/`AMQP_URL` continuam disponiveis quando a
 conexao precisa de algo que as variaveis raiz nao expressam (sslmode, pooler externo, etc.).
 
-### Migration `0002`: `claimed_at`
+### Migrations `0002` e `0003`: `claimed_at` e `claim_id`
 
-A migration `0002_add_claimed_at_to_tasks.py` adiciona a coluna `claimed_at` (lease do claim).
-Ela e aplicada pelo `command` do servico `api` no startup, ou manualmente com
-`docker compose exec api alembic upgrade head`. **Nenhum argumento de fila mudou**, portanto ela
-**nao** exige `make reset-broker`: o volume `rabbitmqdata` e as filas existentes seguem validos.
+A migration `0002_add_claimed_at_to_tasks.py` adiciona a coluna `claimed_at` (lease do claim) e a
+`0003_add_claim_id_to_tasks.py` adiciona `claim_id` (token de fencing das report-backs). As duas
+sao `ADD COLUMN ... NULL`, sem indice novo e sem reescrita de tabela. Elas sao aplicadas pelo
+`command` do servico `api` no startup, ou manualmente com
+`docker compose exec api alembic upgrade head`. **Nenhum argumento de fila mudou**, portanto
+nenhuma das duas exige `make reset-broker`: o volume `rabbitmqdata` e as filas existentes seguem
+validos.
 
 ### Armadilha: `PRECONDITION_FAILED (406)`
 
