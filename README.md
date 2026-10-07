@@ -32,9 +32,10 @@ app/
   worker/    main.py (entrypoint + callback), handlers.py, retry.py
   core/      config.py, topology.py, broker.py, logging.py, constants.py, exceptions.py
   db/        base.py, models.py, session.py, repository.py
-alembic/     env.py (async) + versions/0001_create_tasks_table.py
+alembic/     env.py (async) + versions/0001_create_tasks_table.py,
+             versions/0002_add_claimed_at_to_tasks.py
 tests/
-  unit/          6 arquivos, sem servico externo (fakes em memoria)
+  unit/          7 arquivos, sem servico externo (fakes em memoria)
   integration/   conftest.py + os 3 fluxos (RabbitMQ e Postgres reais)
 ```
 
@@ -132,6 +133,12 @@ total.** `decide(retry_count, max_retries)` devolve `DEAD_LETTER` quando
 Resultado final de uma task que falha sempre: **1 mensagem em `dlx_tasks`** e a linha no banco
 com `status = FAILED` e `attempts = 4`.
 
+`mark_failed` grava `FAILED` e **zera `claimed_at`**: a entrega da retentativa seguinte encontra
+uma linha sem claim pendente e a reclama na hora, sem esperar o lease expirar. A escrita de
+`mark_failed` roda num bloco defensivo -- se o Postgres estiver fora ela so loga
+`failed to persist task failure` e o `nack`/`publish` na DLX acontece de qualquer forma, porque
+uma mensagem sem ack e sem nack seguraria um slot de prefetch para sempre.
+
 ### Headers gravados na mensagem morta
 
 | Header | Valor |
@@ -151,15 +158,45 @@ O **corpo original** da mensagem e preservado intacto, para permitir reprocessam
 executa um claim atomico em uma unica instrucao:
 
 ```sql
-INSERT INTO tasks (...) VALUES (...)
-ON CONFLICT (task_id) DO UPDATE SET status = 'PROCESSING', attempts = :attempts, updated_at = now()
-WHERE tasks.status <> 'COMPLETED'
+INSERT INTO tasks (task_id, event_type, payload, status, attempts, claimed_at)
+VALUES (:task_id, :event_type, :payload, 'PROCESSING', :attempts, now())
+ON CONFLICT (task_id) DO UPDATE
+   SET status     = 'PROCESSING',
+       attempts   = :attempts,
+       claimed_at = now(),
+       updated_at = now()
+ WHERE tasks.status <> 'COMPLETED'
+   AND (tasks.status <> 'PROCESSING'
+        OR tasks.claimed_at IS NULL
+        OR tasks.claimed_at < now() - :claim_lease_seconds * interval '1 second')
 RETURNING task_id;
 ```
 
-Se nada e retornado, a linha existente ja estava `COMPLETED`: a entrega e uma duplicata, o
-worker **nao chama o processamento**, apenas da ack. Nao existe janela de corrida entre ler e
-escrever, porque leitura e escrita sao a mesma instrucao.
+**A decisao de processar E o resultado desta instrucao** (linha retornada ou nao). Nao existe
+`SELECT` antes do `UPDATE`, portanto nao existe janela de corrida: leitura e escrita sao a mesma
+instrucao, avaliada pelo relogio do banco.
+
+`claimed_at` e o **lease** do claim (`CLAIM_LEASE_SECONDS`, default `5.0`): ela diz por quanto
+tempo uma linha `PROCESSING` pertence ao consumidor que a reclamou. Sem o lease, duas entregas do
+mesmo `task_id` na mesma janela de prefetch veriam as duas a linha "ainda nao COMPLETED" e
+executariam o efeito colateral duas vezes. Com o lease, os tres resultados possiveis sao:
+
+| Estado da linha | `claimed_at` | Resultado do claim | O que o worker faz |
+|---|---|---|---|
+| inexistente | — | `CLAIMED` (INSERT) | processa (primeira entrega) |
+| `PENDING` / `FAILED` | `NULL` | `CLAIMED` | processa -- **e isto que faz a retentativa funcionar** |
+| `PROCESSING`, claim fora do lease | `>= lease` | `CLAIMED` | processa (worker morto, claim orfao) |
+| `PROCESSING`, claim dentro do lease | `< lease` | `LOCKED` | `nack(requeue=False)`: devolve a mensagem para o hop de retry |
+| `COMPLETED` | `NULL` | `ALREADY_COMPLETED` | so da ack (duplicata, nenhum efeito colateral) |
+
+`COMPLETED` **nunca** volta a ser reclamavel, lease ou nao.
+
+Por que `LOCKED` recebe `nack` e nao `ack`: dar ack perderia a mensagem para sempre se o claim
+vivo nunca reportasse de volta (Postgres fora no meio do caminho de falha, por exemplo). Com o
+`nack` a duplicata concorrente volta pelo retry e, nessa segunda passagem, encontra a linha
+`COMPLETED` (vira duplicata, ack) ou `FAILED` (reclamavel). O custo e **1 hop do orcamento de
+retentativas** e ~`RETRY_TTL_MS` de atraso no ack da duplicata; se o claim ainda estiver ativo no
+ultimo hop, a mensagem vai para `dlx_tasks` -- nunca perda silenciosa.
 
 ---
 
@@ -309,6 +346,11 @@ Duas suites separadas pelo marker `integration`:
 O `addopts` do `pyproject.toml` ja traz `-m 'not integration'`, portanto `pytest -q` roda
 somente a suite unitaria.
 
+A suite unitaria inclui `test_worker_failure_routing.py`, que faz **injecao de falha** no caminho
+de erro: `session_scope` e substituido por um contexto que levanta (simulando o Postgres fora) e
+os testes provam que a mensagem ainda recebe `nack` (ou vai para a DLX, no ultimo hop) e que o
+erro de persistencia e logado como `failed to persist task failure`.
+
 ### Suite de integracao
 
 ```bash
@@ -333,12 +375,14 @@ Detalhes importantes:
   (default `postgresql+asyncpg://app:app@localhost:5432/async_event_worker`) e `TEST_AMQP_URL`
   (default `amqp://guest:guest@localhost:5672/`).
 
-Os tres fluxos cobertos:
+Os fluxos cobertos:
 
 | Arquivo | Fluxo | O que prova |
 |---|---|---|
 | `test_success_flow.py` | sucesso | a task chega a `COMPLETED` com `result` preenchido, `error` nulo, `attempts == 1` e nada em `test_dlx_tasks`. |
-| `test_idempotency.py` | idempotencia | duas entregas do mesmo `task_id` produzem **1 linha**, `attempts == 1`, e o `result` e o da primeira entrega (a duplicata recebeu ack sem reexecutar). |
+| `test_idempotency.py` | idempotencia (duplicata espacada) | duas entregas do mesmo `task_id` produzem **1 linha**, `attempts == 1`, e o `result` e o da primeira entrega (a duplicata recebeu ack sem reexecutar). |
+| `test_idempotency.py` | idempotencia **concorrente** | duas `handle_task` do mesmo `task_id` em `asyncio.gather` (entregas sobrepostas): o spy compartilhado conta **exatamente 1** execucao do efeito colateral, um outcome `PROCESSED` e o outro pulado. |
+| `test_idempotency.py` | lease do claim | claim dentro do lease devolve `LOCKED`; depois de *backdating* o `claimed_at`, o claim volta a `CLAIMED`; `COMPLETED` segue `ALREADY_COMPLETED`. |
 | `test_dlx_routing.py` | DLX | exatamente **1 mensagem** em `test_dlx_tasks` com `x-attempts == 4` e `x-retry-count == 3`, linha `FAILED` com `attempts == 4`, filas de trabalho e de retry vazias. |
 
 Lint e formatacao:
@@ -379,14 +423,31 @@ Todas as variaveis sao lidas por `app/core/config.py` (pydantic-settings) do amb
 arquivo `.env`. Nenhum nome de fila, exchange, routing key, TTL ou limite aparece como literal
 fora desse modulo. Os principais:
 
+**As URLs sao derivadas, nao escritas duas vezes.** `DATABASE_URL` e `AMQP_URL` sao montadas por
+`Settings` a partir das variaveis raiz de credencial e host -- as **mesmas** que o
+`docker-compose.yml` entrega aos containers do Postgres e do RabbitMQ. Definir a URL completa
+continua valendo como **override explicito**: quando ela vem preenchida (nao vazia), nada e
+derivado.
+
 | Variavel | Default | Para que serve |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://app:app@postgres:5432/async_event_worker` | conexao async do SQLAlchemy |
-| `AMQP_URL` | `amqp://guest:guest@rabbitmq:5672/` | conexao do RabbitMQ |
+| `POSTGRES_USER` | `app` | usuario do Postgres (container e aplicacao) |
+| `POSTGRES_PASSWORD` | `app` | senha do Postgres; percent-encoded na derivacao da URL |
+| `POSTGRES_DB` | `async_event_worker` | nome do banco |
+| `POSTGRES_HOST` | `postgres` | host de conexao (`localhost` ao rodar fora dos containers) |
+| `POSTGRES_PORT` | `5432` | porta publicada no host pelo Compose |
+| `DATABASE_URL` | derivada das 5 acima | override opcional da conexao async do SQLAlchemy |
+| `RABBITMQ_DEFAULT_USER` | `guest` | usuario do RabbitMQ (container e aplicacao) |
+| `RABBITMQ_DEFAULT_PASS` | `guest` | senha do RabbitMQ; percent-encoded na derivacao da URL |
+| `RABBITMQ_HOST` | `rabbitmq` | host do broker (`localhost` fora dos containers) |
+| `RABBITMQ_PORT` | `5672` | porta AMQP publicada no host pelo Compose |
+| `RABBITMQ_VHOST` | `/` | vhost; `/` ou vazio = URL terminando em `/` |
+| `AMQP_URL` | derivada das 5 acima | override opcional da conexao do RabbitMQ |
 | `TASK_MAX_RETRIES` | `3` | retentativas antes da DLX (4 processamentos) |
 | `RETRY_TTL_MS` | `5000` | atraso entre retentativas (`x-message-ttl`) |
 | `WORKER_PREFETCH_COUNT` | `10` | mensagens em voo por consumidor (QoS) |
 | `PROCESSING_DELAY_SECONDS` | `0.5` | duracao do processamento simulado |
+| `CLAIM_LEASE_SECONDS` | `5.0` | lease do claim idempotente; regra: `>= PROCESSING_DELAY_SECONDS` e `<= RETRY_TTL_MS/1000` |
 | `TOPOLOGY_PREFIX` | vazio | prefixo de todos os nomes de fila/exchange (a suite de integracao usa `test_`) |
 | `LOG_LEVEL` | `INFO` | nivel do logging JSON em stdout |
 
@@ -416,10 +477,23 @@ A lista completa esta em `.env.example`.
 
 As credenciais default do `docker-compose.yml` (`app`/`app` no Postgres, `guest`/`guest` no
 RabbitMQ) servem **apenas para desenvolvimento local**. O arquivo usa exclusivamente
-`${VAR:-default}`, sem segredo literal: em qualquer outro cenario defina
-`POSTGRES_USER`, `POSTGRES_PASSWORD`, `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`,
-`DATABASE_URL` e `AMQP_URL` pelo ambiente (ou por um gerenciador de segredos) e nunca commite o
-`.env`.
+`${VAR:-default}`, sem segredo literal.
+
+**Sobrescrever a senha em UM lugar basta.** `POSTGRES_PASSWORD` e `RABBITMQ_DEFAULT_PASS` chegam
+ao container do servico **e** aos servicos `api`/`worker`, e `Settings` deriva as URLs delas --
+nao existe mais uma segunda copia da senha dentro de `DATABASE_URL`/`AMQP_URL`. A senha e
+percent-encoded na derivacao, portanto `@`, `:` e `/` nela nao corrompem a URL. Em qualquer
+ambiente que nao seja dev local, defina `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+`RABBITMQ_DEFAULT_USER` e `RABBITMQ_DEFAULT_PASS` pelo ambiente (ou por um gerenciador de
+segredos) e nunca commite o `.env`. `DATABASE_URL`/`AMQP_URL` continuam disponiveis quando a
+conexao precisa de algo que as variaveis raiz nao expressam (sslmode, pooler externo, etc.).
+
+### Migration `0002`: `claimed_at`
+
+A migration `0002_add_claimed_at_to_tasks.py` adiciona a coluna `claimed_at` (lease do claim).
+Ela e aplicada pelo `command` do servico `api` no startup, ou manualmente com
+`docker compose exec api alembic upgrade head`. **Nenhum argumento de fila mudou**, portanto ela
+**nao** exige `make reset-broker`: o volume `rabbitmqdata` e as filas existentes seguem validos.
 
 ### Armadilha: `PRECONDITION_FAILED (406)`
 

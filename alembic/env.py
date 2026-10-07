@@ -16,7 +16,10 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# A URL derivada em Settings traz usuario e senha percent-encoded (uma senha
+# "p@ss" vira "p%40ss"). O configparser do Alembic interpola "%", entao o sinal
+# precisa ser duplicado aqui; ele volta ao normal na leitura da secao.
+config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 
