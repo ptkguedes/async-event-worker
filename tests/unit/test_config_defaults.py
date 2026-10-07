@@ -105,6 +105,22 @@ def test_claim_lease_must_be_positive() -> None:
         _settings(claim_lease_seconds=0)
 
 
+def test_database_timeout_defaults() -> None:
+    settings = _settings()
+    assert settings.db_connect_timeout_seconds == 5.0
+    assert settings.db_statement_timeout_ms == 10_000
+    # Folga sobre o maior statement da app (single-row pela PRIMARY KEY) e
+    # sobre o lease do claim, para que o timeout nao estrangule o fluxo normal.
+    assert settings.db_statement_timeout_ms / 1000 > settings.claim_lease_seconds
+
+
+def test_database_timeouts_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        _settings(db_connect_timeout_seconds=0)
+    with pytest.raises(ValueError):
+        _settings(db_statement_timeout_ms=-1)
+
+
 def test_derived_urls_match_the_previous_literal_defaults(clean_url_env: None) -> None:
     """A derivacao default e byte a byte igual as URLs que eram literais."""
     settings = _settings()

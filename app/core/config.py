@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     db_echo: bool = False
     db_pool_size: int = 5
     db_max_overflow: int = 10
+    # Timeouts de I/O do banco. Sem eles um Postgres que aceita o TCP e nunca
+    # responde penduraria o callback do worker antes de qualquer ack/nack,
+    # segurando um slot de prefetch para sempre.
+    # 5.0s para abrir conexao: na rede do Compose isso leva milissegundos, e e
+    # o mesmo teto que a suite de integracao usa para decidir "indisponivel".
+    db_connect_timeout_seconds: float = Field(5.0, gt=0)
+    # 10s por statement: toda instrucao da app e single-row pela PRIMARY KEY
+    # (upsert do claim, UPDATE da report-back, SELECT do GET), ordem de
+    # milissegundos -- 3 ordens de grandeza de folga, entao nenhum teste floca.
+    # Ao mesmo tempo o pior caso de retencao de uma mensagem antes do ack/nack
+    # passa a ser limitado (~5s + ~10s) em vez de infinito, e muito abaixo do
+    # `consumer_timeout` default do RabbitMQ (30 min).
+    db_statement_timeout_ms: int = Field(10_000, gt=0)
 
     # Broker: idem, os aliases sao os nomes que a imagem do RabbitMQ ja usa.
     rabbitmq_user: str = Field("guest", validation_alias="RABBITMQ_DEFAULT_USER")
