@@ -1,5 +1,7 @@
 # async-event-worker
 
+[![CI](https://github.com/ptkguedes/async-event-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/ptkguedes/async-event-worker/actions/workflows/ci.yml)
+
 Arquitetura orientada a eventos e mensageria assincrona em Python 3.12: uma **API publisher**
 (FastAPI) que aceita eventos e responde `202 Accepted` imediatamente, um **worker consumidor**
 AMQP que processa as mensagens em segundo plano e persiste o resultado no PostgreSQL, com
